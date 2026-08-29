@@ -1,3 +1,4 @@
+import { createRemoteJWKSet, jwtVerify } from "jose";
 import handler from "vinext/server/app-router-entry";
 
 const emptyRoster = {
@@ -29,14 +30,51 @@ function setupError(message: string) {
   );
 }
 
-async function serveRoster(env: any, ctx: any) {
-  // Cloudflare Access attaches ctx.access only after a request has passed an
-  // Access policy. This prevents the roster from becoming a public asset even
-  // though the Worker itself has a workers.dev URL.
-  if (!ctx?.access) {
-    return setupError(
-      "Cloudflare Access has not authenticated this request. Protect this Worker with Access and sign in with an authorized account.",
+function normalizedTeamDomain(value: unknown) {
+  const raw = String(value ?? "").trim().replace(/\/$/, "");
+  if (!raw) return "";
+  return /^https:\/\//i.test(raw) ? raw : `https://${raw}`;
+}
+
+async function authenticate(request: Request, env: any) {
+  const teamDomain = normalizedTeamDomain(env?.TEAM_DOMAIN);
+  const audience = String(env?.POLICY_AUD ?? "").trim();
+  const allowedEmails = String(env?.AUTHORIZED_EMAILS ?? "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (!teamDomain || !audience || !allowedEmails.length) {
+    throw new Error(
+      "Cloudflare Access is not fully configured. TEAM_DOMAIN, POLICY_AUD, and AUTHORIZED_EMAILS are required.",
     );
+  }
+
+  const token = request.headers.get("cf-access-jwt-assertion");
+  if (!token) {
+    throw new Error("Cloudflare Access sign-in is required.");
+  }
+
+  const jwks = createRemoteJWKSet(new URL(`${teamDomain}/cdn-cgi/access/certs`));
+  const { payload } = await jwtVerify(token, jwks, {
+    issuer: teamDomain,
+    audience,
+  });
+
+  const email = String(payload.email ?? "").trim().toLowerCase();
+  if (!email || !allowedEmails.includes(email)) {
+    throw new Error("This Google account is not authorized to access the roster.");
+  }
+
+  return email;
+}
+
+async function serveRoster(request: Request, env: any) {
+  try {
+    await authenticate(request, env);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Access denied.";
+    return setupError(message);
   }
 
   if (!env?.DB) {
@@ -50,6 +88,7 @@ async function serveRoster(env: any, ctx: any) {
       .prepare("SELECT payload FROM roster_chunks ORDER BY chunk_no")
       .all();
     const rows = Array.isArray(result?.results) ? result.results : [];
+
     if (!rows.length) {
       return setupError(
         "The D1 database is connected but contains no roster data. Import the generated San Fabian roster D1 package.",
@@ -75,7 +114,7 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/api/roster.js") {
-      return serveRoster(env, ctx);
+      return serveRoster(request, env);
     }
 
     const response = await handler.fetch(request, env, ctx);
